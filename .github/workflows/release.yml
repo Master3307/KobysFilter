@@ -390,10 +390,17 @@ jobs:
         run: |
           set -euo pipefail
 
+          release_flags=()
+
+          if [[ "$RELEASE_TAG" == v0.* ]]; then
+            release_flags+=(--prerelease --latest=false)
+          fi
+
           gh release create "$RELEASE_TAG" \
             ../release-assets/KobysFilter.zip \
             ../release-assets/KobysFilter.tar.gz \
             ../release-assets/KobysFilter.tar.xz \
             --verify-tag \
             --title "$RELEASE_TAG" \
-            --notes-file ../release-notes.md
+            --notes-file ../release-notes.md \
+            "${release_flags[@]}"
