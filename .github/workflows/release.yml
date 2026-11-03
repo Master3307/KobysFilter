@@ -327,7 +327,6 @@ jobs:
               for page in pages
               for release in page
               if not release['draft']
-              and not release['prerelease']
           ]
 
           releases.sort(
