@@ -17,13 +17,16 @@ jobs:
   detect:
     name: Detect release commit
     runs-on: ubuntu-latest
+
     outputs:
       release: ${{ steps.detect.outputs.release }}
       tag: ${{ steps.detect.outputs.tag }}
+
     steps:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.sha }}
+
       - name: Parse commit subject
         id: detect
         shell: bash
@@ -34,14 +37,19 @@ jobs:
           import subprocess
 
           subject = subprocess.check_output(
-              ['git', 'show', '-s', '--format=%s', 'HEAD'], text=True
+              ['git', 'show', '-s', '--format=%s', 'HEAD'],
+              text=True,
           ).strip()
+
           match = re.fullmatch(
               r'(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)): (\S.*)',
               subject,
           )
+
           with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
-              output.write(f"release={'true' if match else 'false'}\n")
+              output.write(
+                  f"release={'true' if match else 'false'}\n"
+              )
               if match:
                   output.write(f'tag={match.group(1)}\n')
           PY
@@ -52,10 +60,13 @@ jobs:
     if: needs.detect.outputs.release == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 90
+
     permissions:
       contents: write
+
     env:
       RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+
     steps:
       - name: Check out mod source
         uses: actions/checkout@v4
@@ -70,6 +81,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
             echo "::error::Tag $RELEASE_TAG already exists. Use a new version."
             exit 1
@@ -84,15 +96,122 @@ jobs:
           lfs: true
           persist-credentials: false
 
+      - name: Download private Core Keeper dependencies
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.COREKEEPER_DEPS_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$GH_TOKEN" ]; then
+            echo "::error::Missing COREKEEPER_DEPS_TOKEN repository secret."
+            exit 1
+          fi
+
+          mkdir -p dependency-download
+
+          gh release download sdk-0e4e137 \
+            --repo Master3307/CoreKeeperBuildDependencies \
+            --pattern CoreKeeperDependencies.tar.gz \
+            --dir dependency-download
+
+          tar -xzf dependency-download/CoreKeeperDependencies.tar.gz \
+            -C sdk
+
+          test -f sdk/Assets/Plugins/CoreKeeper/PugMod.SDK.Runtime.dll
+          test -f sdk/Assets/Plugins/CoreKeeper/Pug.Other.dll
+
       - name: Assemble temporary SDK project
         shell: bash
         run: |
           set -euo pipefail
+
           mkdir -p sdk/Assets/KobysFilter sdk/Assets/Editor
-          rsync -a --exclude='/.git' --exclude='/.github' \
+
+          rsync -a \
+            --exclude='/.git' \
+            --exclude='/.github' \
             source/ sdk/Assets/KobysFilter/
+
           cp source/.github/unity/ReleaseBuilder.cs \
             sdk/Assets/Editor/ReleaseBuilder.cs
+
+      - name: Configure builder assembly and SDK scripting symbols
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import re
+          from pathlib import Path
+
+          assembly = {
+              "name": "KobysFilter.CI.Editor",
+              "references": [
+                  "ModSDK.Editor",
+                  "PugMod.SDK",
+              ],
+              "includePlatforms": ["Editor"],
+              "autoReferenced": False,
+          }
+
+          Path("sdk/Assets/Editor/ReleaseBuilder.asmdef").write_text(
+              json.dumps(assembly, indent=2) + "\n",
+              encoding="utf-8",
+          )
+
+          path = Path("sdk/ProjectSettings/ProjectSettings.asset")
+          text = path.read_text(encoding="utf-8")
+
+          symbols = (
+              "UNITY_POST_PROCESSING_STACK_V2;"
+              "UNITY_PHYSICS_CUSTOM;"
+              "UNITY_PHYSICS_DISABLE_JOINTS;"
+              "UNITY_ENTITIES_DYNAMIC_SIMPLE_DEPENDENCY;"
+              "NETCODE_COMPONENTS_256;"
+              "ENTITY_STORE_V1;"
+              "DOTS_OUTPUT_SOURCEGEN_FILES;"
+              "PUG_MOD_SDK;"
+              "PUG_USE_MODIO;"
+              "PUG_USE_STEAM;"
+              "USE_PUG_OTHER"
+          )
+
+          section_pattern = (
+              r"(?ms)(^  scriptingDefineSymbols:\n)"
+              r"(.*?)(?=^  \S|\Z)"
+          )
+
+          def update_section(match):
+              entries = match.group(2)
+
+              entries, count = re.subn(
+                  r"(?m)^    Standalone:.*$",
+                  "    Standalone: " + symbols,
+                  entries,
+              )
+
+              if count == 0:
+                  entries += "    Standalone: " + symbols + "\n"
+              elif count != 1:
+                  raise SystemExit(
+                      "Multiple Standalone scripting-symbol entries found"
+                  )
+
+              return match.group(1) + entries
+
+          text, count = re.subn(
+              section_pattern,
+              update_section,
+              text,
+          )
+
+          if count != 1:
+              raise SystemExit(
+                  "Expected one scriptingDefineSymbols section"
+              )
+
+          path.write_text(text, encoding="utf-8")
+          PY
 
       - name: Build mod with Unity
         uses: game-ci/unity-builder@v4
@@ -121,9 +240,17 @@ jobs:
           build = Path('sdk/ReleaseBuild')
           output = Path('release-assets')
           output.mkdir(exist_ok=True)
-          mods = [p.parent for p in build.glob('*/ModManifest.json')]
+
+          mods = [
+              manifest.parent
+              for manifest in build.glob('*/ModManifest.json')
+          ]
+
           if len(mods) != 1:
-              raise SystemExit(f'Expected one built mod; found {len(mods)}')
+              raise SystemExit(
+                  f'Expected one built mod; found {len(mods)}'
+              )
+
           mod = mods[0]
 
           for pattern in ('LICENSE*', 'NOTICE*', 'Third Party Notices*'):
@@ -132,12 +259,21 @@ jobs:
                       shutil.copy2(file, mod / file.name)
 
           with zipfile.ZipFile(
-              output / 'KobysFilter.zip', 'w', zipfile.ZIP_DEFLATED
+              output / 'KobysFilter.zip',
+              'w',
+              zipfile.ZIP_DEFLATED,
           ) as archive:
               for file in sorted(mod.rglob('*')):
                   archive.write(file, file.relative_to(build))
-          for suffix, mode in [('tar.gz', 'w:gz'), ('tar.xz', 'w:xz')]:
-              with tarfile.open(output / f'KobysFilter.{suffix}', mode) as archive:
+
+          for suffix, mode in [
+              ('tar.gz', 'w:gz'),
+              ('tar.xz', 'w:xz'),
+          ]:
+              with tarfile.open(
+                  output / f'KobysFilter.{suffix}',
+                  mode,
+              ) as archive:
                   archive.add(mod, arcname=mod.name)
           PY
 
@@ -155,42 +291,77 @@ jobs:
           from urllib.parse import quote
 
           def git(*args):
-              return subprocess.check_output(['git', *args], text=True).strip()
+              return subprocess.check_output(
+                  ['git', *args],
+                  text=True,
+              ).strip()
 
           subject = git('show', '-s', '--format=%s', 'HEAD')
           heading = subject.split(': ', 1)[1]
           body = git('show', '-s', '--format=%b', 'HEAD')
+
           tag = os.environ['RELEASE_TAG']
           repo = os.environ['GITHUB_REPOSITORY']
           server = os.environ['GITHUB_SERVER_URL']
+
           pages = json.loads(subprocess.check_output(
-              ['gh', 'api', '--paginate', '--slurp',
-               f'repos/{repo}/releases?per_page=100'], text=True
+              [
+                  'gh', 'api', '--paginate', '--slurp',
+                  f'repos/{repo}/releases?per_page=100',
+              ],
+              text=True,
           ))
-          releases = [r for page in pages for r in page
-                      if not r['draft'] and not r['prerelease']]
-          releases.sort(key=lambda r: r.get('published_at') or '', reverse=True)
+
+          releases = [
+              release
+              for page in pages
+              for release in page
+              if not release['draft']
+              and not release['prerelease']
+          ]
+
+          releases.sort(
+              key=lambda release: release.get('published_at') or '',
+              reverse=True,
+          )
+
           previous = None
+
           for release in releases:
               candidate = release['tag_name']
+
               result = subprocess.run(
-                  ['git', 'merge-base', '--is-ancestor',
-                   f'refs/tags/{candidate}', 'HEAD'],
-                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                  [
+                      'git', 'merge-base', '--is-ancestor',
+                      f'refs/tags/{candidate}', 'HEAD',
+                  ],
+                  stdout=subprocess.DEVNULL,
+                  stderr=subprocess.DEVNULL,
               )
+
               if result.returncode == 0:
                   previous = candidate
                   break
+
           if previous:
-              link = (f'{server}/{repo}/compare/'
-                      f'{quote(previous, safe="")}...{quote(tag, safe="")}')
+              link = (
+                  f'{server}/{repo}/compare/'
+                  f'{quote(previous, safe="")}...{quote(tag, safe="")}'
+              )
           else:
               link = f'{server}/{repo}/commits/{quote(tag, safe="")}'
+
           notes = f'# {heading}\n'
+
           if body:
               notes += f'\n{body}\n'
+
           notes += f'\n**Full Changelog**: {link}\n'
-          Path('../release-notes.md').write_text(notes, encoding='utf-8')
+
+          Path('../release-notes.md').write_text(
+              notes,
+              encoding='utf-8',
+          )
           PY
 
       - name: Create version tag
@@ -198,6 +369,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+
           git tag "$RELEASE_TAG" "$GITHUB_SHA"
           git push origin "refs/tags/$RELEASE_TAG"
 
@@ -208,6 +380,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+
           gh release create "$RELEASE_TAG" \
             ../release-assets/KobysFilter.zip \
             ../release-assets/KobysFilter.tar.gz \
