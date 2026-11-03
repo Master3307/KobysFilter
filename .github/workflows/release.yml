@@ -227,6 +227,16 @@ jobs:
           manualExit: true
           allowDirtyBuild: true
 
+      - name: Fix ownership of generated mod files
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          test -d sdk/ReleaseBuild
+
+          sudo chown -R "$(id -u):$(id -g)" sdk/ReleaseBuild
+          chmod -R u+rwX sdk/ReleaseBuild
+
       - name: Package all three archive formats
         shell: bash
         run: |
