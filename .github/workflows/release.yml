@@ -1,0 +1,217 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - master
+      - main
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mod-release
+  cancel-in-progress: false
+
+jobs:
+  detect:
+    name: Detect release commit
+    runs-on: ubuntu-latest
+    outputs:
+      release: ${{ steps.detect.outputs.release }}
+      tag: ${{ steps.detect.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+      - name: Parse commit subject
+        id: detect
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import subprocess
+
+          subject = subprocess.check_output(
+              ['git', 'show', '-s', '--format=%s', 'HEAD'], text=True
+          ).strip()
+          match = re.fullmatch(
+              r'(v(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)\.(?:0|[1-9]\d*)): (\S.*)',
+              subject,
+          )
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as output:
+              output.write(f"release={'true' if match else 'false'}\n")
+              if match:
+                  output.write(f'tag={match.group(1)}\n')
+          PY
+
+  release:
+    name: Build and publish
+    needs: detect
+    if: needs.detect.outputs.release == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ needs.detect.outputs.tag }}
+    steps:
+      - name: Check out mod source
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+          path: source
+          fetch-depth: 0
+          lfs: true
+
+      - name: Reject an existing version
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "::error::Tag $RELEASE_TAG already exists. Use a new version."
+            exit 1
+          fi
+
+      - name: Check out Core Keeper Mod SDK
+        uses: actions/checkout@v4
+        with:
+          repository: Pugstorm/CoreKeeperModSDK
+          ref: 0e4e13794c9609d989abdf10420c32563bb7984a
+          path: sdk
+          lfs: true
+          persist-credentials: false
+
+      - name: Assemble temporary SDK project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p sdk/Assets/KobysFilter sdk/Assets/Editor
+          rsync -a --exclude='/.git' --exclude='/.github' \
+            source/ sdk/Assets/KobysFilter/
+          cp source/.github/unity/ReleaseBuilder.cs \
+            sdk/Assets/Editor/ReleaseBuilder.cs
+
+      - name: Build mod with Unity
+        uses: game-ci/unity-builder@v4
+        env:
+          UNITY_LICENSE: ${{ secrets.UNITY_LICENSE }}
+          UNITY_EMAIL: ${{ secrets.UNITY_EMAIL }}
+          UNITY_PASSWORD: ${{ secrets.UNITY_PASSWORD }}
+        with:
+          projectPath: sdk
+          unityVersion: 6000.0.59f2
+          targetPlatform: StandaloneWindows64
+          buildMethod: ReleaseBuilder.Build
+          manualExit: true
+          allowDirtyBuild: true
+
+      - name: Package all three archive formats
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import shutil
+          import tarfile
+          import zipfile
+
+          source = Path('source')
+          build = Path('sdk/ReleaseBuild')
+          output = Path('release-assets')
+          output.mkdir(exist_ok=True)
+          mods = [p.parent for p in build.glob('*/ModManifest.json')]
+          if len(mods) != 1:
+              raise SystemExit(f'Expected one built mod; found {len(mods)}')
+          mod = mods[0]
+
+          for pattern in ('LICENSE*', 'NOTICE*', 'Third Party Notices*'):
+              for file in source.glob(pattern):
+                  if file.is_file() and not file.name.endswith('.meta'):
+                      shutil.copy2(file, mod / file.name)
+
+          with zipfile.ZipFile(
+              output / 'KobysFilter.zip', 'w', zipfile.ZIP_DEFLATED
+          ) as archive:
+              for file in sorted(mod.rglob('*')):
+                  archive.write(file, file.relative_to(build))
+          for suffix, mode in [('tar.gz', 'w:gz'), ('tar.xz', 'w:xz')]:
+              with tarfile.open(output / f'KobysFilter.{suffix}', mode) as archive:
+                  archive.add(mod, arcname=mod.name)
+          PY
+
+      - name: Prepare release description
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import subprocess
+          from urllib.parse import quote
+
+          def git(*args):
+              return subprocess.check_output(['git', *args], text=True).strip()
+
+          subject = git('show', '-s', '--format=%s', 'HEAD')
+          heading = subject.split(': ', 1)[1]
+          body = git('show', '-s', '--format=%b', 'HEAD')
+          tag = os.environ['RELEASE_TAG']
+          repo = os.environ['GITHUB_REPOSITORY']
+          server = os.environ['GITHUB_SERVER_URL']
+          pages = json.loads(subprocess.check_output(
+              ['gh', 'api', '--paginate', '--slurp',
+               f'repos/{repo}/releases?per_page=100'], text=True
+          ))
+          releases = [r for page in pages for r in page
+                      if not r['draft'] and not r['prerelease']]
+          releases.sort(key=lambda r: r.get('published_at') or '', reverse=True)
+          previous = None
+          for release in releases:
+              candidate = release['tag_name']
+              result = subprocess.run(
+                  ['git', 'merge-base', '--is-ancestor',
+                   f'refs/tags/{candidate}', 'HEAD'],
+                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+              )
+              if result.returncode == 0:
+                  previous = candidate
+                  break
+          if previous:
+              link = (f'{server}/{repo}/compare/'
+                      f'{quote(previous, safe="")}...{quote(tag, safe="")}')
+          else:
+              link = f'{server}/{repo}/commits/{quote(tag, safe="")}'
+          notes = f'# {heading}\n'
+          if body:
+              notes += f'\n{body}\n'
+          notes += f'\n**Full Changelog**: {link}\n'
+          Path('../release-notes.md').write_text(notes, encoding='utf-8')
+          PY
+
+      - name: Create version tag
+        working-directory: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git tag "$RELEASE_TAG" "$GITHUB_SHA"
+          git push origin "refs/tags/$RELEASE_TAG"
+
+      - name: Publish release
+        working-directory: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            ../release-assets/KobysFilter.zip \
+            ../release-assets/KobysFilter.tar.gz \
+            ../release-assets/KobysFilter.tar.xz \
+            --verify-tag \
+            --title "$RELEASE_TAG" \
+            --notes-file ../release-notes.md
